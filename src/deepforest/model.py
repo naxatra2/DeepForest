@@ -301,3 +301,28 @@ class CropModel(LightningModule):
         predicted_class = np.concatenate(predicted_class)
 
         return true_class, predicted_class
+
+
+def simple_vit_model(num_classes=2):
+    """Create a simple Vision Transformer (ViT) model using torchvision's ViT
+    implementation.
+
+    This function loads a pre-trained ViT and replaces its head to match
+    the desired number of classes.
+    """
+    m = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+    m.heads.head = torch.nn.Linear(m.heads.head.in_features, num_classes)
+    return m
+
+
+class TransformerModel(Model):
+    """A simple transformer-based model for deepforest.
+
+    This class implements the create_model method using a Vision
+    Transformer (ViT) for image classification tasks.
+    """
+
+    def create_model(self):
+        # Use the number of classes from the configuration, defaulting to 2 if not provided.
+        num_classes = self.config.get("num_classes", 2)
+        return simple_vit_model(num_classes=num_classes)

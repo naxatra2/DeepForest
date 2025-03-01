@@ -66,11 +66,11 @@ class deepforest(pl.LightningModule, PyTorchModelHubMixin):
         print("Reading config file: {}".format(config_path))
         self.config = utilities.read_config(config_path)
         self.config["num_classes"] = num_classes
-        # If num classes is specified, overwrite config
-        if not num_classes == 1:
-            warnings.warn(
-                "Directly specifying the num_classes arg in deepforest.main will be deprecated in 2.0 in favor of config_args. Use main.deepforest(config_args={'num_classes':value})"
-            )
+
+        # Add an attribute for data format (torchvision or transformers)
+        # Default to "torchvision" if not specified in the config.
+        self.config["data_format"] = self.config.get("data_format", "torchvision")
+        self.data_format = self.config["data_format"]
 
         # Update config with user supplied arguments
         if config_args:
@@ -849,7 +849,12 @@ class deepforest(pl.LightningModule, PyTorchModelHubMixin):
 
         results = []
         for result in batch_results:
-            boxes = visualize.format_boxes(result)
+            if self.data_format == "torchvision":
+                # Process result assuming keys: 'boxes', 'labels', 'scores'
+                boxes = visualize.format_boxes(result)
+            elif self.data_format == "transformers":
+                # Process result according to transformers output format, e.g., using a helper function
+                boxes = visualize.format_transformer_boxes(result)
             results.append(boxes)
         return results
 
