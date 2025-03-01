@@ -28,6 +28,7 @@ from rasterio.windows import Window
 from torchvision import transforms
 import slidingwindow
 import warnings
+from deepforest.utilities import determine_geometry_type, get_transform
 
 
 def get_transform(augment):
@@ -53,31 +54,38 @@ class TreeDataset(Dataset):
                  transforms=None,
                  label_dict={"Tree": 0},
                  train=True,
-                 preload_images=False):
+                 preload_images=False,
+                 data_format="torchvision"):
         """
-        
+
         Args:
             csv_file (string): Path to a single csv file with annotations.
             root_dir (string): Directory with all the images.
             transform (callable, optional): Optional transform to be applied
                 on a sample.
             label_dict: a dictionary where keys are labels from the csv column and values are numeric labels "Tree" -> 0
-        
+            data_format (str): "torchvision" or "transformers" to yield targets in the appropriate format.
+
+
         Returns:
             If train, path, image, targets else image
         """
         self.annotations = pd.read_csv(csv_file)
         self.root_dir = root_dir
-        if transforms is None:
-            self.transform = get_transform(augment=train)
-        else:
-            self.transform = transforms
+
         self.image_names = self.annotations.image_path.unique()
         self.label_dict = label_dict
         self.train = train
         self.image_converter = A.Compose([ToTensorV2()])
         self.preload_images = preload_images
+        self.data_format = data_format
 
+        # Determine the geometry type (e.g., "box", "polygon", or "point")
+        self.geometry_type = determine_geometry_type(self.annotations)
+        if transforms is None:
+            self.transform = get_transform(augment=train)
+        else:
+            self.transform = transforms
         # Pin data to memory if desired
         if self.preload_images:
             print("Pinning dataset to GPU memory")
@@ -105,39 +113,96 @@ class TreeDataset(Dataset):
             image_annotations = self.annotations[self.annotations.image_path ==
                                                  self.image_names[idx]]
             targets = {}
-            targets["boxes"] = image_annotations[["xmin", "ymin", "xmax",
-                                                  "ymax"]].values.astype("float32")
 
-            # Labels need to be encoded
-            targets["labels"] = image_annotations.label.apply(
-                lambda x: self.label_dict[x]).values.astype(np.int64)
+            if self.geometry_type == "box":
+                boxes = image_annotations[["xmin", "ymin", "xmax",
+                                           "ymax"]].values.astype("float32")
+                labels = image_annotations.label.apply(
+                    lambda x: self.label_dict[x]).values.astype(np.int64)
+                targets["boxes"] = boxes
+                targets["labels"] = labels
+                if self.data_format == "transformers":
+                    # For transformer models, add area and iscrowd keys
+                    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                    targets["area"] = areas
+                    targets["iscrowd"] = np.zeros((boxes.shape[0],), dtype=np.int64)
+            elif self.geometry_type == "polygon":
+                # Assume a "polygon" column with comma-separated coordinates, e.g. "x1,y1,x2,y2,..."
+                polygons = image_annotations.polygon.apply(lambda s: np.array(
+                    [float(v) for v in s.split(",")]).reshape(-1, 2)).values
+                labels = image_annotations.label.apply(
+                    lambda x: self.label_dict[x]).values.astype(np.int64)
+                targets["polygons"] = polygons
+                targets["labels"] = labels
+            elif self.geometry_type == "point":
+                points = image_annotations[["x", "y"]].values.astype("float32")
+                labels = image_annotations.label.apply(
+                    lambda x: self.label_dict[x]).values.astype(np.int64)
+                targets["points"] = points
+                targets["labels"] = labels
+            else:
+                raise ValueError("Unsupported geometry type: {}".format(
+                    self.geometry_type))
 
-            # If image has no annotations, don't augment
-            if np.sum(targets["boxes"]) == 0:
-                boxes = torch.zeros((0, 4), dtype=torch.float32)
-                labels = torch.zeros(0, dtype=torch.int64)
-                # channels last
-                image = np.rollaxis(image, 2, 0)
-                image = torch.from_numpy(image).float()
-                targets = {"boxes": boxes, "labels": labels}
+            # Handle case with no annotations (for box type, sum is zero)
+            if self.geometry_type == "box" and np.sum(targets["boxes"]) == 0:
+                boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+                labels_tensor = torch.zeros(0, dtype=torch.int64)
+                image_tensor = torch.from_numpy(np.rollaxis(image, 2, 0)).float()
+                targets = {"boxes": boxes_tensor, "labels": labels_tensor}
+                return self.image_names[idx], image_tensor, targets
 
-                return self.image_names[idx], image, targets
+            # Apply augmentation using the transform function, passing the right key based on geometry
+            if self.geometry_type == "box":
+                augmented = self.transform(image=image,
+                                           bboxes=targets["boxes"],
+                                           category_ids=targets["labels"])
+            elif self.geometry_type == "polygon":
+                augmented = self.transform(image=image,
+                                           polygons=targets["polygons"],
+                                           category_ids=targets["labels"])
+            elif self.geometry_type == "point":
+                augmented = self.transform(image=image,
+                                           points=targets["points"],
+                                           category_ids=targets["labels"])
 
-            augmented = self.transform(image=image,
-                                       bboxes=targets["boxes"],
-                                       category_ids=targets["labels"].astype(np.int64))
-            image = augmented["image"]
+            image_aug = augmented["image"]
 
-            boxes = np.array(augmented["bboxes"])
-            boxes = torch.from_numpy(boxes).float()
-            labels = np.array(augmented["category_ids"])
-            labels = torch.from_numpy(labels.astype(np.int64))
-            targets = {"boxes": boxes, "labels": labels}
+            # Convert augmented annotations to tensors and add extra keys if transformers
+            if self.geometry_type == "box":
+                boxes_aug = np.array(augmented["bboxes"])
+                boxes_tensor = torch.from_numpy(boxes_aug).float()
+                labels_tensor = torch.from_numpy(
+                    np.array(augmented["category_ids"]).astype(np.int64))
+                targets = {"boxes": boxes_tensor, "labels": labels_tensor}
+                if self.data_format == "transformers":
+                    areas = (boxes_tensor[:, 2] - boxes_tensor[:, 0]) * (
+                        boxes_tensor[:, 3] - boxes_tensor[:, 1])
+                    targets["area"] = areas
+                    targets["iscrowd"] = torch.zeros((boxes_tensor.shape[0],),
+                                                     dtype=torch.int64)
+            elif self.geometry_type == "polygon":
+                polygons_aug = augmented["polygons"]
+                # Convert each polygon to a tensor (if not already)
+                polygons_tensor = [
+                    torch.from_numpy(p).float()
+                    if isinstance(p, np.ndarray) else torch.tensor(p, dtype=torch.float32)
+                    for p in polygons_aug
+                ]
+                labels_tensor = torch.from_numpy(
+                    np.array(augmented["category_ids"]).astype(np.int64))
+                targets = {"polygons": polygons_tensor, "labels": labels_tensor}
+            elif self.geometry_type == "point":
+                points_aug = np.array(augmented["points"])
+                points_tensor = torch.from_numpy(points_aug).float()
+                labels_tensor = torch.from_numpy(
+                    np.array(augmented["category_ids"]).astype(np.int64))
+                targets = {"points": points_tensor, "labels": labels_tensor}
 
-            return self.image_names[idx], image, targets
+            return self.image_names[idx], image_aug, targets
 
         else:
-            # Mimic the train augmentation
+            # For non-training mode, simply convert the image to a tensor
             converted = self.image_converter(image=image)
             return converted["image"]
 
@@ -150,7 +215,7 @@ class TileDataset(Dataset):
                  patch_size: int = 400,
                  patch_overlap: float = 0.05):
         """
-        
+
         Args:
             tile: an in memory numpy array.
             patch_size (int): The size for the crops used to cut the input raster into smaller pieces. This is given in pixels, not any geographic unit.
